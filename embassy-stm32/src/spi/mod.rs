@@ -584,11 +584,11 @@ impl<'d> Spi<'d, Async> {
     #[allow(dead_code)]
     pub(crate) fn new_internal<T: Instance>(
         peri: impl Peripheral<P = T> + 'd,
-        tx_dma: impl Peripheral<P = impl TxDma<T>> + 'd,
-        rx_dma: impl Peripheral<P = impl RxDma<T>> + 'd,
+        tx_dma: Option<ChannelAndRequest<'d>>,
+        rx_dma: Option<ChannelAndRequest<'d>>,
         config: Config,
     ) -> Self {
-        Self::new_inner(peri, None, None, None, new_dma!(tx_dma), new_dma!(rx_dma), config)
+        Self::new_inner(peri, None, None, None, tx_dma, rx_dma, config)
     }
 
     /// SPI write, using DMA.
