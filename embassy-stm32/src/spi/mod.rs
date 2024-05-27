@@ -508,6 +508,7 @@ impl<'d> Spi<'d, Async> {
         peri: impl Peripheral<P = T> + 'd,
         sck: impl Peripheral<P = impl SckPin<T>> + 'd,
         miso: impl Peripheral<P = impl MisoPin<T>> + 'd,
+        #[cfg(any(spi_v1, spi_f1, spi_v2, spi_v4, spi_v5))] tx_dma: impl Peripheral<P = impl TxDma<T>> + 'd,
         rx_dma: impl Peripheral<P = impl RxDma<T>> + 'd,
         config: Config,
     ) -> Self {
@@ -516,6 +517,9 @@ impl<'d> Spi<'d, Async> {
             new_pin!(sck, AFType::OutputPushPull, Speed::VeryHigh, config.sck_pull_mode()),
             None,
             new_pin!(miso, AFType::Input, Speed::VeryHigh),
+            #[cfg(any(spi_v1, spi_f1, spi_v2, spi_v4, spi_v5))]
+            new_dma!(tx_dma),
+            #[cfg(spi_v3)]
             None,
             new_dma!(rx_dma),
             config,
@@ -623,11 +627,84 @@ impl<'d> Spi<'d, Async> {
 
     /// SPI read, using DMA.
     pub async fn read<W: Word>(&mut self, data: &mut [W]) -> Result<(), Error> {
+        #[cfg(any(spi_v1, spi_f1, spi_v2, spi_v4, spi_v5))]
+        {
+            self.transmission_read(data).await
+        }
+        #[cfg(spi_v3)]
+        {
+            self.tsize_read(data).await
+        }
+    }
+
+    #[cfg(spi_v3)]
+    async fn tsize_read<W: Word>(&mut self, data: &mut [W]) -> Result<(), Error> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let tsize = self.info.regs.cr2().read().tsize();
+
+        let rx_src = self.info.regs.rx_ptr();
+
+        let mut read = 0;
+        let mut remaining = data.len();
+
+        loop {
+            self.set_word_size(W::CONFIG);
+            set_rxdmaen(self.info.regs, true);
+
+            let transfer_size = remaining.min(u16::max_value().into());
+
+            let transfer = unsafe {
+                self.rx_dma
+                    .as_mut()
+                    .unwrap()
+                    .read(rx_src, &mut data[read..(read + transfer_size)], Default::default())
+            };
+
+            self.info.regs.cr2().modify(|w| {
+                w.set_tsize(transfer_size as u16);
+            });
+
+            self.info.regs.cr1().modify(|w| {
+                w.set_spe(true);
+            });
+
+            self.info.regs.cr1().modify(|w| {
+                w.set_cstart(true);
+            });
+
+            transfer.await;
+
+            remaining -= transfer_size;
+
+            if remaining == 0 {
+                break;
+            }
+
+            read += transfer_size;
+
+            self.info.regs.cr1().modify(|w| {
+                w.set_spe(false);
+            });
+        }
+
+        self.info.regs.cr2().modify(|w| {
+            w.set_tsize(tsize);
+        });
+
+        Ok(())
+    }
+
+    #[cfg(any(spi_v1, spi_f1, spi_v2, spi_v4, spi_v5))]
+    async fn transmission_read<W: Word>(&mut self, data: &mut [W]) -> Result<(), Error> {
         if data.is_empty() {
             return Ok(());
         }
 
         self.set_word_size(W::CONFIG);
+
         self.info.regs.cr1().modify(|w| {
             w.set_spe(false);
         });
