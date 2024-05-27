@@ -588,11 +588,11 @@ impl<'d> Spi<'d, Async> {
     #[allow(dead_code)]
     pub(crate) fn new_internal<T: Instance>(
         peri: impl Peripheral<P = T> + 'd,
-        tx_dma: impl Peripheral<P = impl TxDma<T>> + 'd,
-        rx_dma: impl Peripheral<P = impl RxDma<T>> + 'd,
+        tx_dma: Option<ChannelAndRequest<'d>>,
+        rx_dma: Option<ChannelAndRequest<'d>>,
         config: Config,
     ) -> Self {
-        Self::new_inner(peri, None, None, None, new_dma!(tx_dma), new_dma!(rx_dma), config)
+        Self::new_inner(peri, None, None, None, tx_dma, rx_dma, config)
     }
 
     /// SPI write, using DMA.
@@ -643,6 +643,26 @@ impl<'d> Spi<'d, Async> {
             return Ok(());
         }
 
+        self.info.regs.cr1().modify(|w| {
+            w.set_spe(false);
+        });
+
+        self.info.regs.cfg2().modify(|w| {
+            w.set_comm(vals::Comm::RECEIVER);
+        });
+
+        let i2scfg = self.info.regs.i2scfgr().modify(|w| {
+            let prev = w.i2scfg();
+            w.set_i2scfg(match prev {
+                vals::I2scfg::SLAVETX | vals::I2scfg::SLAVERX | vals::I2scfg::SLAVEFULLDUPLEX => vals::I2scfg::SLAVERX,
+                vals::I2scfg::MASTERFULLDUPLEX | vals::I2scfg::MASTERTX | vals::I2scfg::MASTERRX => {
+                    vals::I2scfg::MASTERRX
+                }
+                x => x,
+            });
+            prev
+        });
+
         let tsize = self.info.regs.cr2().read().tsize();
 
         let rx_src = self.info.regs.rx_ptr();
@@ -675,7 +695,11 @@ impl<'d> Spi<'d, Async> {
                 w.set_cstart(true);
             });
 
+            info!("starting wait....");
             transfer.await;
+            info!("finished waiting....");
+
+            finish_dma(self.info.regs);
 
             remaining -= transfer_size;
 
@@ -684,16 +708,23 @@ impl<'d> Spi<'d, Async> {
             }
 
             read += transfer_size;
-
-            self.info.regs.cr1().modify(|w| {
-                w.set_spe(false);
-            });
         }
+
+        self.info.regs.cr1().modify(|w| {
+            w.set_spe(false);
+        });
+
+        self.info.regs.cfg2().modify(|w| {
+            w.set_comm(vals::Comm::FULLDUPLEX);
+        });
 
         self.info.regs.cr2().modify(|w| {
             w.set_tsize(tsize);
         });
 
+        self.info.regs.i2scfgr().modify(|w| {
+            w.set_i2scfg(i2scfg);
+        });
         Ok(())
     }
 
@@ -984,7 +1015,13 @@ fn finish_dma(regs: Regs) {
     while regs.sr().read().ftlvl().to_bits() > 0 {}
 
     #[cfg(any(spi_v3, spi_v4, spi_v5))]
-    while !regs.sr().read().txc() {}
+    {
+        if regs.cr2().read().tsize() == 0 {
+            while !regs.sr().read().txc() {}
+        } else {
+            while !regs.sr().read().eot() {}
+        }
+    }
     #[cfg(not(any(spi_v3, spi_v4, spi_v5)))]
     while regs.sr().read().bsy() {}
 
