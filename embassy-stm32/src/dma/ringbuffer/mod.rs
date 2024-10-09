@@ -147,22 +147,19 @@ impl<'a, W: Word> ReadableDmaRingBuffer<'a, W> {
         let mut read_data = 0;
         let buffer_len = buffer.len();
 
-        poll_fn(|cx| {
-            dma.set_waker(cx.waker());
-
-            match self.read(dma, &mut buffer[read_data..buffer_len]) {
-                Ok((len, remaining)) => {
-                    read_data += len;
-                    if read_data == buffer_len {
-                        Poll::Ready(Ok(remaining))
-                    } else {
-                        Poll::Pending
-                    }
-                }
-                Err(e) => Poll::Ready(Err(e)),
+        Ok(loop {
+            let (len, available) = self.read(dma, &mut buffer[read_data..buffer_len])?;
+            read_data += len;
+            if read_data == buffer_len {
+                break available;
+            } else if buffer_len - read_data > available {
+                poll_fn::<(), _>(|ctx| {
+                    dma.set_waker(ctx.waker());
+                    Poll::Pending
+                })
+                .await;
             }
         })
-        .await
     }
 
     fn read_raw(&mut self, dma: &mut impl DmaCtrl, buf: &mut [W]) -> Result<(usize, usize), Error> {
@@ -261,22 +258,19 @@ impl<'a, W: Word> WritableDmaRingBuffer<'a, W> {
         let mut written_data = 0;
         let buffer_len = buffer.len();
 
-        poll_fn(|cx| {
-            dma.set_waker(cx.waker());
-
-            match self.write(dma, &buffer[written_data..buffer_len]) {
-                Ok((len, remaining)) => {
-                    written_data += len;
-                    if written_data == buffer_len {
-                        Poll::Ready(Ok(remaining))
-                    } else {
-                        Poll::Pending
-                    }
-                }
-                Err(e) => Poll::Ready(Err(e)),
+        Ok(loop {
+            let (len, available) = self.write(dma, &buffer[written_data..buffer_len])?;
+            written_data += len;
+            if written_data == buffer_len {
+                break available;
+            } else if buffer_len - written_data > available {
+                poll_fn::<(), _>(|ctx| {
+                    dma.set_waker(ctx.waker());
+                    Poll::Pending
+                })
+                .await;
             }
         })
-        .await
     }
 
     fn write_raw(&mut self, dma: &mut impl DmaCtrl, buf: &[W]) -> Result<(usize, usize), Error> {
