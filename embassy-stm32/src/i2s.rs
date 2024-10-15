@@ -60,8 +60,14 @@ pub enum Error {
     Overrun,
 }
 
-impl From<ringbuffer::OverrunError> for Error {
-    fn from(_: ringbuffer::OverrunError) -> Self {
+impl From<ringbuffer::Error> for Error {
+    fn from(#[allow(unused)] err: ringbuffer::Error) -> Self {
+        #[cfg(feature = "defmt")]
+        {
+            if err == ringbuffer::Error::DmaUnsynced {
+                defmt::error!("Ringbuffer broken invariants detected!");
+            }
+        }
         Self::Overrun
     }
 }
@@ -171,6 +177,46 @@ impl Default for Config {
             clock_polarity: ClockPolarity::IdleLow,
             master_clock: true,
         }
+    }
+}
+
+/// I2S driver writer. Useful for moving write functionality across tasks.
+pub struct Writer<'s, 'd, W: Word>(&'s mut WritableRingBuffer<'d, W>);
+
+impl<'s, 'd, W: Word> Writer<'s, 'd, W> {
+    /// Write data to the I2S ringbuffer.
+    /// This appends the data to the buffer and returns immediately. The data will be transmitted in the background.
+    /// If thfre’s no space in the buffer, this waits until there is.
+    pub async fn write(&mut self, data: &[W]) -> Result<(), Error> {
+        self.0.write_exact(data).await?;
+        Ok(())
+    }
+
+    /// Reset the ring buffer to its initial state.
+    /// Can be used to recover from overrun.
+    /// The ringbuffer will always auto-reset on Overrun in any case.
+    pub fn reset(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// I2S driver reader. Useful for moving read functionality across tasks.
+pub struct Reader<'s, 'd, W: Word>(&'s mut ReadableRingBuffer<'d, W>);
+
+impl<'s, 'd, W: Word> Reader<'s, 'd, W> {
+    /// Read data from the I2S ringbuffer.
+    /// SAI is always receiving data in the background. This function pops already-received data from the buffer.
+    /// If there’s less than data.len() data in the buffer, this waits until there is.
+    pub async fn read(&mut self, data: &mut [W]) -> Result<(), Error> {
+        self.0.read_exact(data).await?;
+        Ok(())
+    }
+
+    /// Reset the ring buffer to its initial state.
+    /// Can be used to prevent overrun.
+    /// The ringbuffer will always auto-reset on Overrun in any case.
+    pub fn reset(&mut self) {
+        self.0.clear();
     }
 }
 
@@ -379,15 +425,25 @@ impl<'d, W: Word> I2S<'d, W> {
         self.clear();
     }
 
+    /// Split the driver into a Reader/Writer pair.
+    /// Useful for splitting the reader/writer functionality across tasks or
+    /// for calling the read/write methods in parallel.
+    pub fn split<'s>(&'s mut self) -> Result<(Reader<'s, 'd, W>, Writer<'s, 'd, W>), Error> {
+        match (&mut self.rx_ring_buffer, &mut self.tx_ring_buffer) {
+            (None, _) => Err(Error::NotAReceiver),
+            (_, None) => Err(Error::NotATransmitter),
+            (Some(rx_ring), Some(tx_ring)) => Ok((Reader(rx_ring), Writer(tx_ring))),
+        }
+    }
+
     /// Read data from the I2S ringbuffer.
     /// SAI is always receiving data in the background. This function pops already-received data from the buffer.
     /// If there’s less than data.len() data in the buffer, this waits until there is.
     pub async fn read(&mut self, data: &mut [W]) -> Result<(), Error> {
         match &mut self.rx_ring_buffer {
-            Some(ring) => ring.read_exact(data).await?,
-            _ => return Err(Error::NotAReceiver),
-        };
-        Ok(())
+            Some(ring) => Reader(ring).read(data).await,
+            _ => Err(Error::NotAReceiver),
+        }
     }
 
     /// Write data to the I2S ringbuffer.
@@ -395,22 +451,9 @@ impl<'d, W: Word> I2S<'d, W> {
     /// If thfre’s no space in the buffer, this waits until there is.
     pub async fn write(&mut self, data: &[W]) -> Result<(), Error> {
         match &mut self.tx_ring_buffer {
-            Some(ring) => ring.write_exact(data).await?,
-            _ => return Err(Error::NotATransmitter),
-        };
-        Ok(())
-    }
-
-    /// Write and write data to the I2S ringbuffer simultanously.
-    pub async fn read_write(&mut self, read: &mut [W], write: &[W]) -> Result<(), Error> {
-        let (rx_fut, tx_fut) = match (&mut self.rx_ring_buffer, &mut self.tx_ring_buffer) {
-            (Some(rx), Some(tx)) => (rx.read_exact(read), tx.write_exact(write)),
-            (None, _) => return Err(Error::NotAReceiver),
-            (_, None) => return Err(Error::NotATransmitter),
-        };
-        let (rx_res, tx_res) = join(rx_fut, tx_fut).await;
-        let _ = (rx_res?, tx_res?);
-        Ok(())
+            Some(ring) => Writer(ring).write(data).await,
+            _ => Err(Error::NotATransmitter),
+        }
     }
 
     /// Write data directly to the raw I2S ringbuffer.
